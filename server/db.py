@@ -67,6 +67,16 @@ CREATE TABLE IF NOT EXISTS session (
     expires_at INTEGER NOT NULL
 );
 
+-- Per-user status of the web-triggered AnkiWeb sync. Holds NO credentials --
+-- only the last result and the last shipped EPUB hash (for change detection).
+CREATE TABLE IF NOT EXISTS sync_state (
+    username   TEXT PRIMARY KEY REFERENCES user(username),
+    status     TEXT NOT NULL DEFAULT 'idle',
+    message    TEXT NOT NULL DEFAULT '',
+    last_hash  TEXT,
+    updated_at INTEGER NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_book_owner_inbox
     ON book(owner, delivered_at);
 CREATE INDEX IF NOT EXISTS idx_session_expires ON session(expires_at);
@@ -195,6 +205,46 @@ class Database:
             conn.execute(
                 "DELETE FROM session WHERE expires_at <= ?", (int(time.time()),)
             )
+
+    # -- sync state --------------------------------------------------------
+    def get_sync_state(self, username: str) -> sqlite3.Row | None:
+        with self._tx() as conn:
+            return conn.execute(
+                "SELECT * FROM sync_state WHERE username = ?", (username,)
+            ).fetchone()
+
+    def set_sync_state(
+        self,
+        username: str,
+        status: str,
+        message: str,
+        last_hash: str | None = None,
+        update_hash: bool = False,
+    ) -> None:
+        """Upsert a user's sync status.
+
+        ``last_hash`` is only written when ``update_hash`` is True, so a
+        'running'/'error' update doesn't clobber the last good hash.
+        """
+        now = int(time.time())
+        with self._tx() as conn:
+            if update_hash:
+                conn.execute(
+                    "INSERT INTO sync_state(username, status, message, last_hash, "
+                    "updated_at) VALUES(?, ?, ?, ?, ?) "
+                    "ON CONFLICT(username) DO UPDATE SET status=excluded.status, "
+                    "message=excluded.message, last_hash=excluded.last_hash, "
+                    "updated_at=excluded.updated_at",
+                    (username, status, message, last_hash, now),
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO sync_state(username, status, message, updated_at) "
+                    "VALUES(?, ?, ?, ?) "
+                    "ON CONFLICT(username) DO UPDATE SET status=excluded.status, "
+                    "message=excluded.message, updated_at=excluded.updated_at",
+                    (username, status, message, now),
+                )
 
     # -- ingest ------------------------------------------------------------
     def store_book(

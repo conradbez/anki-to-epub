@@ -20,6 +20,7 @@ from fastapi import APIRouter, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 
 from . import auth
+from .ankisync import start_sync
 from .db import UserExists
 from .tokens import new_token
 
@@ -180,6 +181,24 @@ def rotate_token(request: Request, csrfmiddlewaretoken: str = Form("")):
     return RedirectResponse("/dashboard", status_code=303)
 
 
+@router.post("/dashboard/sync", response_class=HTMLResponse)
+def sync_now(
+    request: Request,
+    anki_username: str = Form(...),
+    anki_password: str = Form(...),
+    book_title: str = Form(""),
+    csrfmiddlewaretoken: str = Form(""),
+):
+    user = _current_user(request)
+    if not user:
+        return RedirectResponse("/login/", status_code=303)
+    if _check_csrf(request, csrfmiddlewaretoken) and anki_username and anki_password:
+        title = book_title.strip() or "My Anki Decks"
+        # Credentials are handed straight to the background sync and never stored.
+        start_sync(_db(request), user, anki_username, anki_password, title)
+    return RedirectResponse("/dashboard", status_code=303)
+
+
 @router.get("/dashboard", response_class=HTMLResponse)
 def dashboard(request: Request):
     user = _current_user(request)
@@ -262,6 +281,17 @@ code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px;
   background:rgba(128,128,128,.15);padding:1px 5px;border-radius:4px}
 .rowforms{display:flex;gap:10px;flex-wrap:wrap}
 .rowforms form{flex:1;min-width:150px}
+.status{padding:10px 12px;border-radius:8px;font-size:14px;margin:6px 0 4px;
+  border:1px solid rgba(128,128,128,.3)}
+.status.ok{background:#e7f6ec;color:#1a7f37;border-color:#a6e0b8}
+.status.err{background:#fdecea;color:#b3261e;border-color:#f4c7c3}
+.status.run{background:#eef3fe;color:#274bb5;border-color:#c3d3f7}
+@media(prefers-color-scheme:dark){
+  .status.ok{background:#12301d;color:#7ee2a0;border-color:#1f5c33}
+  .status.err{background:#3b1f1e;color:#f2b8b5;border-color:#5c2b28}
+  .status.run{background:#161d33;color:#a9bef5;border-color:#28407a}}
+.ago{opacity:.7;font-weight:400}
+button:disabled{opacity:.6;cursor:default}
 """
 
 _COPY_JS = """
@@ -274,14 +304,18 @@ document.addEventListener('click',function(e){
 """
 
 
-def _page(title: str, body: str, *, logged_in: bool = False) -> str:
+def _page(title: str, body: str, *, logged_in: bool = False, refresh: int = 0) -> str:
     nav = ""
     if logged_in:
         nav = '<a href="/dashboard">Dashboard</a>'
+    refresh_meta = (
+        f'<meta http-equiv="refresh" content="{refresh}">' if refresh else ""
+    )
     return (
         "<!doctype html>\n<html lang=\"en\"><head>"
         '<meta charset="utf-8">'
         '<meta name="viewport" content="width=device-width, initial-scale=1">'
+        f"{refresh_meta}"
         f"<title>{html.escape(title)}</title>"
         f"<style>{_CSS}</style>"
         '<link rel="icon" href="data:image/svg+xml,'
@@ -297,6 +331,19 @@ def _page(title: str, body: str, *, logged_in: bool = False) -> str:
 
 def _err_html(error: str | None) -> str:
     return f'<div class="err">{html.escape(error)}</div>' if error else ""
+
+
+def _relative_time(ts: int) -> str:
+    import time
+
+    delta = max(0, int(time.time()) - int(ts))
+    if delta < 60:
+        return "just now"
+    if delta < 3600:
+        return f"{delta // 60} min ago"
+    if delta < 86400:
+        return f"{delta // 3600} h ago"
+    return f"{delta // 86400} d ago"
 
 
 def _signup_page(request: Request, csrf: str = "", error: str | None = None) -> str:
@@ -357,6 +404,47 @@ def _copy_row(field_id: str, value: str) -> str:
     )
 
 
+_STATUS_CLASS = {"ok": "ok", "error": "err", "running": "run", "idle": ""}
+
+
+def _sync_card(db, username: str, esc_csrf: str) -> tuple[str, bool]:
+    """Return (html, is_running) for the AnkiWeb sync card."""
+    state = db.get_sync_state(username)
+    banner = ""
+    running = False
+    if state is not None and state["status"] != "idle":
+        cls = _STATUS_CLASS.get(state["status"], "")
+        running = state["status"] == "running"
+        when = _relative_time(state["updated_at"])
+        banner = (
+            f'<div class="status {cls}">{html.escape(state["message"])}'
+            f'<span class="ago"> · {when}</span></div>'
+        )
+    card = (
+        '<div class="card"><h1>Sync your Anki decks</h1>'
+        "<p>Log in to AnkiWeb to pull every deck and deliver a fresh EPUB to "
+        "your Inbox. Your AnkiWeb password is used only for this sync and is "
+        "<strong>never stored</strong>.</p>"
+        f"{banner}"
+        '<form method="post" action="/dashboard/sync">'
+        f'<input type="hidden" name="csrfmiddlewaretoken" value="{esc_csrf}">'
+        '<label for="id_anki_username">AnkiWeb email</label>'
+        '<input type="text" name="anki_username" id="id_anki_username" '
+        'autocapitalize="none" autocomplete="off" required>'
+        '<label for="id_anki_password">AnkiWeb password</label>'
+        '<input type="password" name="anki_password" id="id_anki_password" '
+        'autocomplete="off" required>'
+        '<label for="id_book_title">Book title (optional)</label>'
+        '<input type="text" name="book_title" id="id_book_title" '
+        'placeholder="My Anki Decks">'
+        '<button type="submit"'
+        + (" disabled" if running else "")
+        + ">Sync now</button></form>"
+        "</div>"
+    )
+    return card, running
+
+
 def _dashboard_page(request: Request, username: str, csrf: str) -> str:
     db = _db(request)
     token = db.user_token(username) or ""
@@ -365,6 +453,7 @@ def _dashboard_page(request: Request, username: str, csrf: str) -> str:
     reader_url = f"{base}/k/{token}/"
     upload_url = f"{base}/upload"
     esc_csrf = html.escape(csrf)
+    sync_card, running = _sync_card(db, username, esc_csrf)
 
     body = (
         f'<div class="card"><h1>Welcome, {html.escape(username)}</h1>'
@@ -372,6 +461,7 @@ def _dashboard_page(request: Request, username: str, csrf: str) -> str:
         f'<div class="stat"><b>{inbox}</b><span>in Inbox</span></div>'
         f'<div class="stat"><b>{total}</b><span>total books</span></div>'
         "</div></div>"
+        f"{sync_card}"
         '<div class="card"><h1>Your reader</h1>'
         "<p>Add this URL as an OPDS catalog in your e-ink reader "
         "(KOReader, Marvin, Foliate…). No username or password &mdash; the "
@@ -379,9 +469,9 @@ def _dashboard_page(request: Request, username: str, csrf: str) -> str:
         '<div class="kv"><div class="k">Reader catalog URL</div>'
         f"{_copy_row('reader_url', reader_url)}</div>"
         "</div>"
-        '<div class="card"><h1>Sync job settings</h1>'
-        "<p>Set these environment variables for the "
-        "<code>python -m sync</code> job that uploads your decks:</p>"
+        '<div class="card"><h1>Automate with the CLI (optional)</h1>'
+        "<p>Prefer a scheduled/nightly sync? Set these environment variables for "
+        "the <code>python -m sync</code> job:</p>"
         '<div class="kv"><div class="k">OPDS_UPLOAD_URL</div>'
         f"{_copy_row('upload_url', upload_url)}</div>"
         '<div class="kv"><div class="k">OPDS_TOKEN</div>'
@@ -399,4 +489,5 @@ def _dashboard_page(request: Request, username: str, csrf: str) -> str:
         '<button type="submit" class="secondary">Sign out</button></form>'
         "</div></div>"
     )
-    return _page("Dashboard", body, logged_in=True)
+    # Auto-refresh while a sync is running so status updates without a click.
+    return _page("Dashboard", body, logged_in=True, refresh=5 if running else 0)

@@ -34,7 +34,8 @@ reader downloads it once.
 | `anki/colpkg.py`    | Reads cards by parsing a `.colpkg` export with stdlib `sqlite3` (see below). |
 | `epub/builder.py`   | `build_epub(decks, title)` — deterministic EPUB2+EPUB3, stdlib `zipfile` only. |
 | `server/app.py`     | FastAPI + SQLite OPDS server: content-addressed storage, deliver-once Inbox. |
-| `server/web.py`     | Browser account UI: signup, login, logout, dashboard. |
+| `server/web.py`     | Browser account UI: signup, login, logout, dashboard, Sync now. |
+| `server/ankisync.py`| In-process AnkiWeb sync triggered from the dashboard (background thread). |
 | `sync.py`           | The glue: log in → read decks → build → hash → upload if changed. |
 
 ### How cards are read
@@ -75,14 +76,30 @@ Create an account from the web UI (the same flow as a normal web app):
 
 - `GET /signup/` — create an account (username + password).
 - `GET /login/` — sign in.
-- `GET /dashboard` — after login, shows your **reader catalog URL**
-  (`/k/<token>/`) and the **`OPDS_UPLOAD_URL` / `OPDS_TOKEN`** values to paste
-  into the sync job, plus a *Regenerate token* button if a token ever leaks.
+- `GET /dashboard` — after login, lets you **Sync now** (below), and shows your
+  **reader catalog URL** (`/k/<token>/`), the CLI `OPDS_UPLOAD_URL` /
+  `OPDS_TOKEN` values, and a *Regenerate token* button if a token ever leaks.
 - `/` redirects to the dashboard (if signed in) or the login page.
 
 Passwords are stored as PBKDF2-HMAC-SHA256 with a per-user salt; sessions are
 server-side (an opaque id in an HttpOnly, `SameSite=Lax` cookie) and form POSTs
 carry a double-submit CSRF token. Set `SIGNUP_CODE` to gate open signup.
+
+### Sync from the web (no CLI needed)
+
+The dashboard has a **Sync your Anki decks** form: enter your AnkiWeb email and
+password and click **Sync now**. The server logs in to AnkiWeb, reads every
+deck, builds the consolidated EPUB, and drops it straight into your Inbox — the
+same pipeline as `python -m sync`, but in-process and on demand. Status
+(running / synced / error) shows on the dashboard and refreshes itself while a
+sync runs.
+
+Your **AnkiWeb password is used only for that one sync and is never stored or
+logged** — it is not written to the database and never appears in status
+messages. (That's why automatic nightly syncing still uses the CLI/cron path
+with env-var credentials; the web path is manual by design.) Unchanged decks
+produce an identical EPUB hash, so re-syncing is a no-op and your Inbox stays
+quiet.
 
 > Prefer the CLI (e.g. for scripting)? `python -m server.admin add <owner>`
 > still provisions an account + token without the web form.
@@ -149,8 +166,9 @@ python -m pytest
 Covers: protobuf codec round-trip; `build_epub` structural validity
 (mimetype-first-and-stored, `container.xml`, one chapter per deck, deterministic
 bytes for identical input); the `.colpkg` reader; upload dedup by sha256; the
-Inbox emptying after download; and the web account flow (signup, login, logout,
-CSRF, token minting).
+Inbox emptying after download; the web account flow (signup, login, logout,
+CSRF, token minting); and the web-triggered sync (delivers a book, skips
+unchanged decks, reports errors without leaking the password).
 
 ## Guardrails
 
