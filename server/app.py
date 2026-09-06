@@ -26,6 +26,7 @@ from . import opds
 from .db import Database
 from .tokens import is_valid_shape
 from .validate import InvalidEpub, extract_title, validate_epub
+from .web import router as web_router
 
 # Guardrail: bound upload size so a malicious client can't exhaust disk/memory.
 _MAX_UPLOAD_BYTES = 64 * 1024 * 1024
@@ -34,6 +35,9 @@ app = FastAPI(title="anki-deck-reader OPDS")
 
 _config = ServerConfig.from_env()
 _db = Database(os.path.join(_config.data_dir, "library.db"))
+# Share the single DB handle with the web UI routes (see server/web.py).
+app.state.db = _db
+app.include_router(web_router)
 
 
 def _resolve_owner(token: str) -> str:
