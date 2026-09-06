@@ -1,0 +1,19 @@
+{
+  "$schema": "https://railway.app/railway.schema.json",
+  "build": {
+    "builder": "NIXPACKS"
+  },
+  "deploy": {
+    "startCommand": "uvicorn server.app:app --host 0.0.0.0 --port $PORT",
+    "restartPolicyType": "ON_FAILURE",
+    "restartPolicyMaxRetries": 3,
+    "numReplicas": 1
+  },
+  "//": "SQLite has one writer -> replicas MUST stay at 1. Mount a volume at DATA_DIR (e.g. /data) so the library and last-hash state survive redeploys. Add a nightly cron service running 'python -m sync' (see README).",
+  "cron": [
+    {
+      "schedule": "0 3 * * *",
+      "command": "python -m sync"
+    }
+  ]
+}

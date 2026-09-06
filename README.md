@@ -1,114 +1,147 @@
-Build a new Python app called `anki-deck-reader` that pulls every deck from a
-user's AnkiWeb account, binds them into a single EPUB (one chapter per deck),
-and auto-syncs that EPUB onto an e-ink reader through a self-hosted OPDS library.
-No Anki desktop, no AnkiConnect, no cable, no Calibre.
+# anki-deck-reader
 
-## Product goal
+Pull every deck from an AnkiWeb account, bind them into a single EPUB (one
+chapter per deck), and auto-sync that EPUB onto an e-ink reader through a
+self-hosted OPDS library.
+
+**No Anki desktop, no AnkiConnect, no cable, no Calibre.**
+
 A learner reviews their Anki cards on an e-ink reader. A scheduled job rebuilds
 one consolidated EPUB from all their decks and delivers it; the reader pulls it
 exactly once, and it refreshes automatically whenever the decks change.
 
-## Stack & constraints
-- Python 3.13, standard library first. Third-party: `requests` (AnkiWeb client),
-  `fastapi` + `uvicorn` + `python-multipart` (upload/OPDS server), `pillow`
-  (cover rendering only). EPUB generation and parsing = stdlib `zipfile` +
-  `xml.etree` ONLY — no ebooklib.
-- Deployable on Railway (Procfile + railway.json). SQLite on one volume,
-  `replicas = 1` (SQLite has one writer).
-- Credentials come ONLY from environment variables — never hard-coded, never
-  committed, never logged.
+## How it works
 
-## Architecture — three components
+```
+AnkiWeb ──(anki/client.py)──> decks & cards
+        ──(epub/builder.py)──> one deterministic EPUB (sha256)
+        ──(sync.py)─────────> POST /upload  ─────> OPDS server (server/)
+                                                    e-ink reader pulls
+                                                    /k/<token>/  (Inbox)
+```
 
-### 1. AnkiWeb client (`anki/client.py`)
-AnkiWeb's web app is a SPA talking to a protobuf-over-HTTP backend under `/svc/`,
-`Content-Type: application/octet-stream`. Implement a MINIMAL hand-rolled
-protobuf codec (varints + length-delimited fields only) — do not add protobuf
-as a dependency. Helpers needed: `pb_string(field, str)`, `pb_int(field, int)`,
-`pb_message(field, bytes)`, and `pb_parse(bytes) -> list[(field_no, wire, value)]`.
+Change detection is free: unchanged decks produce a **byte-identical** EPUB, so
+its hash is unchanged, the upload is a no-op, and the reader's Inbox stays quiet.
+Change a card and the hash changes, a new book appears in the Inbox, and the
+reader downloads it once.
 
-The backend is split across two hosts sharing one account:
-- `https://ankiuser.net`  — editor service
-- `https://ankiweb.net`   — decks service
+## Components
 
-Endpoints (login sets an `ankiweb` session cookie):
-- POST `/svc/account/login`            body = pb_string(1, user)+pb_string(2, pass);
-                                       response field 1 (varint) == 1 means SUCCESS.
-- POST `/svc/editor/get-info-for-adding` -> lists notetypes (field 1) and decks
-                                       (field 2), each a submessage {1:id, 2:name};
-                                       field 3 = current_deck_id, 4 = current_notetype_id.
-- POST `/svc/editor/get-notetype-fields` body = pb_int(1, notetype_id) -> field
-                                       names in order (e.g. Front, Back).
+| Path                | Role |
+|---------------------|------|
+| `anki/protobuf.py`  | Minimal hand-rolled protobuf codec (varint + length-delimited). No `protobuf` dependency. |
+| `anki/client.py`    | AnkiWeb login + deck/notetype listing over `/svc/`. |
+| `anki/colpkg.py`    | Reads cards by parsing a `.colpkg` export with stdlib `sqlite3` (see below). |
+| `epub/builder.py`   | `build_epub(decks, title)` — deterministic EPUB2+EPUB3, stdlib `zipfile` only. |
+| `server/`           | FastAPI + SQLite OPDS server: content-addressed storage, deliver-once Inbox. |
+| `sync.py`           | The glue: log in → read decks → build → hash → upload if changed. |
 
-NEW capability to reverse-engineer: **reading cards out of a deck.** The browse/
-search reviewer in the SPA calls a `/svc/...` service with an Anki search query
-(e.g. `deck:"Spanish"`). Capture the exact path + request/response shape from
-browser devtools and implement `cards_in_deck(name) -> list[(front, back)]`.
-If no usable read endpoint exists, implement the FALLBACK: download AnkiWeb's
-full `.colpkg` export and read the `notes` table with stdlib `sqlite3`. Pick one,
-document which, and make the interface identical either way.
+### How cards are read
 
-Expose: `login(user, pass)`, `decks() -> [(id, name)]`, `cards_in_deck(name)`,
-and `read_all() -> [(deck_name, [(front, back), ...]), ...]` (name-sorted decks,
-skip empty decks).
+The README's spec allows either a reverse-engineered read RPC **or** a fallback
+that downloads the full `.colpkg` export and reads it with `sqlite3`. **This
+implementation uses the `.colpkg` fallback** — it has no dependency on an
+undocumented, version-unstable SPA endpoint. `anki/colpkg.py` opens the export's
+`collection.anki21`/`.anki2` SQLite database read-only and joins
+`cards → notes → decks` to produce `{deck_name: [(front, back), …]}`. The public
+`cards_in_deck()` / `read_all()` interface is identical regardless of strategy,
+so an RPC reader can be dropped in later without touching callers.
 
-### 2. EPUB builder (`epub/builder.py`)
-Pure function: `build_epub(decks, title="My Anki Decks") -> bytes`. Stdlib
-`zipfile` only. Requirements:
-- First archive entry MUST be `mimetype`, stored UNCOMPRESSED, contents
-  `application/epub+zip`.
-- `META-INF/container.xml` pointing at `OEBPS/content.opf`.
-- `content.opf` (manifest + spine), `toc.ncx` (EPUB2) AND `nav.xhtml` (EPUB3) —
-  emit both so more e-ink firmwares show the chapter list.
-- One XHTML chapter per deck: deck name as `<h1>`, each card a Front→Back block
-  (`<hr/>` between). HTML-escape all field text in v1.
-- DETERMINISTIC output: sorted decks, stable card order, fixed date-based book id,
-  so an unchanged collection produces byte-identical EPUBs (this drives sync).
+> The one endpoint that needs confirming against live devtools is the export
+> download path in `AnkiWebClient._download_export`. For offline use, set
+> `ANKI_COLPKG_PATH` to a manually exported `.colpkg` and everything downstream
+> works unchanged.
 
-### 3. OPDS delivery server (`server/`)
-FastAPI + SQLite. Content-addressed storage and deliver-once semantics:
-- `Blob(sha256 PK, size, data, cover)` — one row per distinct file, dedup by hash.
-- `Book(owner, sha256, title, filename, size, has_cover, added_at, delivered_at)`
-  with a UNIQUE constraint on (owner, sha256). `delivered_at IS NULL` == still in
-  the Inbox (the entire delivery record).
-- `POST /upload` — accepts an EPUB (multipart), validates magic bytes (`PK`) +
-  `mimetype` entry + `META-INF/container.xml`, streams to temp file while hashing,
-  stores Blob+Book atomically. Re-uploading an identical file is a no-op.
-- Per-account **capability URL** `GET /k/<token>/` = an OPDS Atom feed of that
-  account's UNDELIVERED books (the Inbox). Token is the whole credential (16 chars,
-  unambiguous alphabet). Sub-feeds `All Books` and `Recent`.
-- Downloading a book stamps `delivered_at` so it leaves the Inbox.
+## Configuration (environment variables only)
 
-### 4. Sync job (`sync.py`, runnable as `python -m sync`)
-1. `client.login()`, `client.read_all()`.
-2. `build_epub(decks)`, `sha256` the bytes.
-3. If hash == last shipped hash, log "unchanged" and stop.
-4. POST the EPUB to the upload endpoint with the account token.
-Change detection is free: unchanged decks -> identical hash -> ingest no-op ->
-Inbox stays quiet; changed decks -> new hash -> new Book -> reappears in Inbox.
-Note in a comment the "supersede previous book" option (delete the sender's
-prior consolidated book on new upload) as a follow-up, not v1.
+Credentials come **only** from the environment — never hard-coded, committed, or
+logged. Copy `.env.example` to `.env`:
 
-## Configuration (env only)
-ANKI_USERNAME, ANKI_PASSWORD, OPDS_UPLOAD_URL, OPDS_TOKEN, ANKI_BOOK_TITLE (opt),
-DATA_DIR (default ./data), SECRET_KEY, ALLOWED_HOSTS.
+| Var | Used by | Notes |
+|-----|---------|-------|
+| `ANKI_USERNAME`, `ANKI_PASSWORD` | sync | AnkiWeb login |
+| `OPDS_UPLOAD_URL` | sync | e.g. `https://your-app.up.railway.app/upload` |
+| `OPDS_TOKEN` | sync | account capability token (see below) |
+| `ANKI_BOOK_TITLE` | sync | optional, default `My Anki Decks` |
+| `ANKI_COLPKG_PATH` | sync | optional; read a local export instead of AnkiWeb |
+| `DATA_DIR` | server | default `./data`; put the SQLite file + sync state here |
+| `SECRET_KEY`, `ALLOWED_HOSTS` | server | |
 
-## Deliverables
-- Working code for all four components, wired together.
-- `requirements.txt`, `Procfile`, `railway.json`, `.env.example`, `README.md`
-  (local run + Railway deploy + reader setup steps).
-- Tests: protobuf codec round-trip; `build_epub` produces a structurally valid
-  EPUB (unzip, assert mimetype-first-and-stored, container.xml, one chapter per
-  deck, deterministic bytes for identical input); upload dedup by sha256;
-  Inbox empties after download.
-- Railway nightly cron entry that runs `python -m sync`.
+## Local run
+
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+
+# 1. Start the OPDS server
+export DATA_DIR=./data
+uvicorn server.app:app --reload --port 8000
+
+# 2. Provision an account + capability token (prints the token once)
+python -m server.admin add household
+#   -> token=ABCDEFGHJKMNPQRS   inbox_url=/k/ABCDEFGHJKMNPQRS/
+
+# 3. Run the sync job
+export ANKI_USERNAME=... ANKI_PASSWORD=...
+export OPDS_UPLOAD_URL=http://localhost:8000/upload
+export OPDS_TOKEN=ABCDEFGHJKMNPQRS
+python -m sync
+```
+
+Point a browser or OPDS client at `http://localhost:8000/k/<token>/`.
+
+## Reader setup (e-ink)
+
+Most e-ink readers with an OPDS catalog client (KOReader, Marvin, Foliate, etc.)
+just need the capability URL:
+
+1. In the reader's OPDS/catalog settings, **add a catalog** with URL
+   `https://<your-host>/k/<token>/`. No username/password — the token *is* the
+   credential.
+2. Open **Inbox** to see undelivered books. Downloading a book stamps it
+   delivered, so it leaves the Inbox and won't be pulled again.
+3. **All Books** and **Recent** sub-feeds show history.
+
+Keep the token secret and use HTTPS — anyone with the URL can read the Inbox.
+
+## Railway deploy
+
+1. Create a Railway project from this repo (`Procfile` + `railway.json` are
+   included). It uses Nixpacks and starts `uvicorn server.app:app`.
+2. **Add a volume** and set `DATA_DIR` to its mount path (e.g. `/data`) so the
+   library and last-hash state survive redeploys. Keep **`replicas = 1`** —
+   SQLite has a single writer.
+3. Set `SECRET_KEY`, `ALLOWED_HOSTS`.
+4. Provision the account token once via a Railway shell:
+   `python -m server.admin add household`.
+5. **Nightly cron:** `railway.json` declares a cron entry
+   (`0 3 * * *` → `python -m sync`). Set `ANKI_USERNAME`, `ANKI_PASSWORD`,
+   `OPDS_UPLOAD_URL`, `OPDS_TOKEN` on the cron service (or as shared variables).
+
+## Tests
+
+```bash
+pip install pytest httpx
+python -m pytest
+```
+
+Covers: protobuf codec round-trip; `build_epub` structural validity
+(mimetype-first-and-stored, `container.xml`, one chapter per deck, deterministic
+bytes for identical input); the `.colpkg` reader; upload dedup by sha256; and the
+Inbox emptying after download.
 
 ## Guardrails
-- Credentials env-only; never in source, never logged, never echoed in errors.
-- Cap all reads out of any zip archive so a malicious EPUB can't balloon memory.
-- Don't trust filenames — a file is an EPUB because its bytes say so.
-- Keep it small: this targets one household (~5 users), sized for exactly that.
 
-Start by scaffolding the repo and the protobuf codec + AnkiWeb login (verify
-login works against the live service before building further), then the EPUB
-builder with tests, then the server, then the sync glue.
+- Credentials are env-only — never in source, never logged, never echoed in errors.
+- Every read out of a zip archive (uploads, colpkg, EPUB validation) is size-capped
+  so a malicious archive can't balloon memory.
+- A file is treated as an EPUB because its **bytes** say so (`PK` magic +
+  `mimetype` entry + `container.xml`), not because of its filename.
+- Sized for one household (~5 users).
+
+## Follow-ups (not v1)
+
+- **Supersede previous book:** on a new upload, delete the sender's prior
+  consolidated book so the Inbox never accumulates stale editions.
+- Cover rendering with Pillow (dependency already declared).
+- Rich card HTML (currently all field text is HTML-escaped as plain text).
