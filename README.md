@@ -33,7 +33,8 @@ reader downloads it once.
 | `anki/client.py`    | AnkiWeb login + deck/notetype listing over `/svc/`. |
 | `anki/colpkg.py`    | Reads cards by parsing a `.colpkg` export with stdlib `sqlite3` (see below). |
 | `epub/builder.py`   | `build_epub(decks, title)` — deterministic EPUB2+EPUB3, stdlib `zipfile` only. |
-| `server/`           | FastAPI + SQLite OPDS server: content-addressed storage, deliver-once Inbox. |
+| `server/app.py`     | FastAPI + SQLite OPDS server: content-addressed storage, deliver-once Inbox. |
+| `server/web.py`     | Browser account UI: signup, login, logout, dashboard. |
 | `sync.py`           | The glue: log in → read decks → build → hash → upload if changed. |
 
 ### How cards are read
@@ -66,6 +67,25 @@ logged. Copy `.env.example` to `.env`:
 | `ANKI_COLPKG_PATH` | sync | optional; read a local export instead of AnkiWeb |
 | `DATA_DIR` | server | default `./data`; put the SQLite file + sync state here |
 | `SECRET_KEY`, `ALLOWED_HOSTS` | server | |
+| `SIGNUP_CODE` | server | optional; if set, the web signup page requires this code |
+
+## Accounts
+
+Create an account from the web UI (the same flow as a normal web app):
+
+- `GET /signup/` — create an account (username + password).
+- `GET /login/` — sign in.
+- `GET /dashboard` — after login, shows your **reader catalog URL**
+  (`/k/<token>/`) and the **`OPDS_UPLOAD_URL` / `OPDS_TOKEN`** values to paste
+  into the sync job, plus a *Regenerate token* button if a token ever leaks.
+- `/` redirects to the dashboard (if signed in) or the login page.
+
+Passwords are stored as PBKDF2-HMAC-SHA256 with a per-user salt; sessions are
+server-side (an opaque id in an HttpOnly, `SameSite=Lax` cookie) and form POSTs
+carry a double-submit CSRF token. Set `SIGNUP_CODE` to gate open signup.
+
+> Prefer the CLI (e.g. for scripting)? `python -m server.admin add <owner>`
+> still provisions an account + token without the web form.
 
 ## Local run
 
@@ -74,30 +94,29 @@ python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
 # 1. Start the OPDS server
-export DATA_DIR=./data
+export DATA_DIR=./data SECRET_KEY=$(python -c "import secrets;print(secrets.token_hex(32))")
 uvicorn server.app:app --reload --port 8000
 
-# 2. Provision an account + capability token (prints the token once)
-python -m server.admin add household
-#   -> token=ABCDEFGHJKMNPQRS   inbox_url=/k/ABCDEFGHJKMNPQRS/
+# 2. Create an account in the browser at http://localhost:8000/signup/
+#    then copy the reader URL + OPDS_TOKEN from the dashboard.
 
 # 3. Run the sync job
 export ANKI_USERNAME=... ANKI_PASSWORD=...
 export OPDS_UPLOAD_URL=http://localhost:8000/upload
-export OPDS_TOKEN=ABCDEFGHJKMNPQRS
+export OPDS_TOKEN=<token from the dashboard>
 python -m sync
 ```
 
-Point a browser or OPDS client at `http://localhost:8000/k/<token>/`.
+Point your reader (or a browser) at `http://localhost:8000/k/<token>/`.
 
 ## Reader setup (e-ink)
 
 Most e-ink readers with an OPDS catalog client (KOReader, Marvin, Foliate, etc.)
 just need the capability URL:
 
-1. In the reader's OPDS/catalog settings, **add a catalog** with URL
-   `https://<your-host>/k/<token>/`. No username/password — the token *is* the
-   credential.
+1. In the reader's OPDS/catalog settings, **add a catalog** with the URL from
+   your dashboard, `https://<your-host>/k/<token>/`. No username/password — the
+   token *is* the credential.
 2. Open **Inbox** to see undelivered books. Downloading a book stamps it
    delivered, so it leaves the Inbox and won't be pulled again.
 3. **All Books** and **Recent** sub-feeds show history.
@@ -112,8 +131,10 @@ Keep the token secret and use HTTPS — anyone with the URL can read the Inbox.
    library and last-hash state survive redeploys. Keep **`replicas = 1`** —
    SQLite has a single writer.
 3. Set `SECRET_KEY`, `ALLOWED_HOSTS`.
-4. Provision the account token once via a Railway shell:
-   `python -m server.admin add household`.
+4. Create your account at `https://<your-app>/signup/` and copy the reader URL
+   and `OPDS_TOKEN` from the dashboard (or use `python -m server.admin add
+   <owner>` in a Railway shell). Set `SIGNUP_CODE` first if you want to keep
+   signup private.
 5. **Nightly cron:** `railway.json` declares a cron entry
    (`0 3 * * *` → `python -m sync`). Set `ANKI_USERNAME`, `ANKI_PASSWORD`,
    `OPDS_UPLOAD_URL`, `OPDS_TOKEN` on the cron service (or as shared variables).
@@ -127,8 +148,9 @@ python -m pytest
 
 Covers: protobuf codec round-trip; `build_epub` structural validity
 (mimetype-first-and-stored, `container.xml`, one chapter per deck, deterministic
-bytes for identical input); the `.colpkg` reader; upload dedup by sha256; and the
-Inbox emptying after download.
+bytes for identical input); the `.colpkg` reader; upload dedup by sha256; the
+Inbox emptying after download; and the web account flow (signup, login, logout,
+CSRF, token minting).
 
 ## Guardrails
 

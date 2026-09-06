@@ -19,6 +19,10 @@ import sqlite3
 import time
 from contextlib import contextmanager
 
+class UserExists(Exception):
+    """Raised when creating a user whose username is already taken."""
+
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS blob (
     sha256 TEXT PRIMARY KEY,
@@ -45,8 +49,27 @@ CREATE TABLE IF NOT EXISTS account (
     owner TEXT NOT NULL UNIQUE
 );
 
+-- Web accounts: username + salted password hash + the account's capability
+-- token. The token is the same credential used by /upload and /k/<token>/.
+CREATE TABLE IF NOT EXISTS user (
+    username   TEXT PRIMARY KEY,
+    pw_hash    TEXT NOT NULL,
+    pw_salt    TEXT NOT NULL,
+    token      TEXT NOT NULL UNIQUE,
+    created_at INTEGER NOT NULL
+);
+
+-- Server-side browser sessions (cookie holds only an opaque id).
+CREATE TABLE IF NOT EXISTS session (
+    sid        TEXT PRIMARY KEY,
+    username   TEXT NOT NULL REFERENCES user(username),
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_book_owner_inbox
     ON book(owner, delivered_at);
+CREATE INDEX IF NOT EXISTS idx_session_expires ON session(expires_at);
 """
 
 
@@ -95,6 +118,84 @@ class Database:
             ).fetchone()
             return row["owner"] if row else None
 
+    # -- web users ---------------------------------------------------------
+    def create_user(
+        self, username: str, pw_hash: str, pw_salt: str, token: str
+    ) -> None:
+        """Create a web account and its capability token.
+
+        Raises :class:`UserExists` if the username is already taken.
+        """
+        now = int(time.time())
+        try:
+            with self._tx() as conn:
+                conn.execute(
+                    "INSERT INTO user(username, pw_hash, pw_salt, token, created_at) "
+                    "VALUES(?, ?, ?, ?, ?)",
+                    (username, pw_hash, pw_salt, token, now),
+                )
+                # Keep the token->owner mapping used by /upload and /k feeds.
+                conn.execute(
+                    "INSERT INTO account(token, owner) VALUES(?, ?)",
+                    (token, username),
+                )
+        except sqlite3.IntegrityError as exc:
+            raise UserExists(str(exc)) from exc
+
+    def get_user(self, username: str) -> sqlite3.Row | None:
+        with self._tx() as conn:
+            return conn.execute(
+                "SELECT * FROM user WHERE username = ?", (username,)
+            ).fetchone()
+
+    def user_token(self, username: str) -> str | None:
+        row = self.get_user(username)
+        return row["token"] if row else None
+
+    def rotate_token(self, username: str, new_token: str) -> None:
+        with self._tx() as conn:
+            row = conn.execute(
+                "SELECT token FROM user WHERE username = ?", (username,)
+            ).fetchone()
+            if row is None:
+                return
+            old = row["token"]
+            conn.execute(
+                "UPDATE user SET token = ? WHERE username = ?", (new_token, username)
+            )
+            conn.execute(
+                "UPDATE account SET token = ? WHERE token = ?", (new_token, old)
+            )
+
+    # -- sessions ----------------------------------------------------------
+    def create_session(self, sid: str, username: str, ttl_seconds: int) -> None:
+        now = int(time.time())
+        with self._tx() as conn:
+            conn.execute(
+                "INSERT INTO session(sid, username, created_at, expires_at) "
+                "VALUES(?, ?, ?, ?)",
+                (sid, username, now, now + ttl_seconds),
+            )
+
+    def session_username(self, sid: str) -> str | None:
+        now = int(time.time())
+        with self._tx() as conn:
+            row = conn.execute(
+                "SELECT username FROM session WHERE sid = ? AND expires_at > ?",
+                (sid, now),
+            ).fetchone()
+            return row["username"] if row else None
+
+    def delete_session(self, sid: str) -> None:
+        with self._tx() as conn:
+            conn.execute("DELETE FROM session WHERE sid = ?", (sid,))
+
+    def purge_expired_sessions(self) -> None:
+        with self._tx() as conn:
+            conn.execute(
+                "DELETE FROM session WHERE expires_at <= ?", (int(time.time()),)
+            )
+
     # -- ingest ------------------------------------------------------------
     def store_book(
         self,
@@ -141,6 +242,19 @@ class Database:
             params = (owner, limit)
         with self._tx() as conn:
             return conn.execute(sql, params).fetchall()
+
+    def counts(self, owner: str) -> tuple[int, int]:
+        """Return ``(inbox_count, total_count)`` for an owner."""
+        with self._tx() as conn:
+            total = conn.execute(
+                "SELECT COUNT(*) AS c FROM book WHERE owner = ?", (owner,)
+            ).fetchone()["c"]
+            inbox = conn.execute(
+                "SELECT COUNT(*) AS c FROM book "
+                "WHERE owner = ? AND delivered_at IS NULL",
+                (owner,),
+            ).fetchone()["c"]
+            return inbox, total
 
     def get_book(self, owner: str, book_id: int) -> sqlite3.Row | None:
         with self._tx() as conn:
